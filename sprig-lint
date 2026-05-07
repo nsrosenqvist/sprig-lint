@@ -335,6 +335,8 @@ sprig-lint — validate commit messages against the Conventional Commits spec
 
 Usage:
   sprig-lint [options] <commit-msg-file>      Lint a single commit message file
+  sprig-lint [options] -                      Lint a message read from stdin
+  sprig-lint [options] --message <string>     Lint a literal string (e.g., a PR title)
   sprig-lint [options] --from REF --to REF    Lint each commit in a range
   sprig-lint [options] --range REF..REF       Same as --from/--to
 
@@ -357,6 +359,9 @@ main() {
   local commit_msg_file=""
   local from_ref=""
   local to_ref=""
+  local message_arg=""
+  local message_arg_set=false
+  local read_stdin=false
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -400,6 +405,20 @@ main() {
         to_ref="${r##*..}"
         shift
         ;;
+      --message)
+        message_arg="${2:-}"
+        message_arg_set=true
+        shift 2 || true
+        ;;
+      --message=*)
+        message_arg="${1#*=}"
+        message_arg_set=true
+        shift
+        ;;
+      -)
+        read_stdin=true
+        shift
+        ;;
       --)
         shift
         if [[ $# -gt 0 ]]; then commit_msg_file="$1"; shift; fi
@@ -427,6 +446,38 @@ main() {
 
   load_config
   validate_severities
+
+  # Mutual-exclusion: count input modes.
+  local input_modes=0
+  [[ -n "${commit_msg_file}" ]] && input_modes=$((input_modes + 1))
+  [[ "${read_stdin}" == "true" ]] && input_modes=$((input_modes + 1))
+  [[ "${message_arg_set}" == "true" ]] && input_modes=$((input_modes + 1))
+  [[ -n "${from_ref}" || -n "${to_ref}" ]] && input_modes=$((input_modes + 1))
+
+  if [[ ${input_modes} -gt 1 ]]; then
+    if [[ "${quiet}" != "true" ]]; then
+      echo "${_red}sprig-lint: error:${_reset} only one of <file>, -, --message, or --from/--to may be used" >&2
+    fi
+    exit 1
+  fi
+
+  # --message mode: lint a literal string.
+  if [[ "${message_arg_set}" == "true" ]]; then
+    lint_message "${message_arg}"
+    print_findings ""
+    if [[ ${total_errors} -gt 0 ]]; then exit 1; fi
+    exit 0
+  fi
+
+  # Stdin mode.
+  if [[ "${read_stdin}" == "true" ]]; then
+    local message
+    message="$(cat)"
+    lint_message "${message}"
+    print_findings ""
+    if [[ ${total_errors} -gt 0 ]]; then exit 1; fi
+    exit 0
+  fi
 
   # Range mode.
   if [[ -n "${from_ref}" || -n "${to_ref}" ]]; then

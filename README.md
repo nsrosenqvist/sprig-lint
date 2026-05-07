@@ -64,6 +64,8 @@ chmod +x .git/hooks/commit-msg
 | `-q`, `--quiet` | Suppress all output (still exits non-zero on failure). For CI. |
 | `--no-color` | Disable ANSI color output (also honors the `NO_COLOR` environment variable). |
 | `-h`, `--help` | Show usage and exit. |
+| `--message <string>` | Lint a literal string (e.g. a PR title). |
+| `-` | Read the message from stdin. |
 | `--from REF --to REF` | Range mode: lint each commit's message in `REF..REF`. |
 | `--range REF..REF` | Same as `--from`/`--to`. |
 
@@ -158,6 +160,31 @@ sprig-lint --from "${base}" --to HEAD
 
 ### GitHub Actions
 
+The simplest path is the bundled composite action, which auto-detects whether to lint the range or the PR title:
+
+```yaml
+name: Commit Lint
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: nsrosenqvist/sprig-lint@v1
+        # Optional inputs:
+        # with:
+        #   mode: range          # range | pr-title | message
+        #   config-path: .github/sprig-lint.cfg
+        #   ref: v1              # pin a specific sprig-lint version
+```
+
+Or invoke the script directly if you'd rather not pull in the action:
+
 ```yaml
 name: Commit Lint
 on: [pull_request]
@@ -182,7 +209,29 @@ GitHub already provides the correct merge-base SHA in `pull_request.base.sha` fo
 
 ### Squash-merge workflows
 
-If your team always squash-merges PRs, the individual commit messages don't end up in `main`'s history — only the squash commit (taken from the PR title) does. In that case, range linting the PR commits is mostly noise. Lint the PR title separately (e.g., a commitlint-style GitHub Action) and skip range mode.
+If your team always squash-merges PRs, the individual commit messages don't end up in `main`'s history — only the squash commit (taken from the PR title) does. In that case, range linting the PR commits is mostly noise; lint the **PR title** instead:
+
+```bash
+sprig-lint --message "$PR_TITLE"
+# or, equivalently
+echo "$PR_TITLE" | sprig-lint -
+```
+
+With the bundled GitHub Action this is a one-liner — just set `mode: pr-title` (or let it auto-detect on `pull_request` events when no range is supplied):
+
+```yaml
+- uses: nsrosenqvist/sprig-lint@v1
+  with:
+    mode: pr-title
+```
+
+Make sure the workflow re-runs when the title is edited:
+
+```yaml
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+```
 
 ## Behavior details
 

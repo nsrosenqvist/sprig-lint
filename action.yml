@@ -1,0 +1,115 @@
+name: 'sprig-lint'
+description: 'Validate commit messages or a PR title against the Conventional Commits spec.'
+author: 'Niklas Rosenqvist'
+branding:
+  icon: 'check-circle'
+  color: 'green'
+
+inputs:
+  mode:
+    description: |
+      One of: 'range' (lint every commit in a PR), 'pr-title' (lint the PR
+      title only), or 'message' (lint the literal string in `message`).
+      Defaults to 'range' on pull_request events, 'pr-title' otherwise when a
+      PR title is available, else 'message'.
+    required: false
+    default: ''
+  message:
+    description: 'Literal commit message / PR title to lint (used by mode=message and mode=pr-title fallback).'
+    required: false
+    default: ''
+  from:
+    description: 'Base ref for range mode. Defaults to the PR base SHA.'
+    required: false
+    default: ''
+  to:
+    description: 'Head ref for range mode. Defaults to the PR head SHA.'
+    required: false
+    default: ''
+  config-path:
+    description: 'Optional path to a .sprig-lint.cfg file (copied into the workspace root before linting).'
+    required: false
+    default: ''
+  ref:
+    description: 'Specific git ref/version of sprig-lint to download. Defaults to the same ref the action is invoked at (or "main" when invoked locally).'
+    required: false
+    default: ''
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Install sprig-lint
+      shell: bash
+      env:
+        INPUT_REF: ${{ inputs.ref }}
+        ACTION_REF: ${{ github.action_ref }}
+      run: |
+        set -euo pipefail
+        ref="${INPUT_REF:-${ACTION_REF:-main}}"
+        curl -fsSL "https://raw.githubusercontent.com/nsrosenqvist/sprig-lint/${ref}/sprig-lint" \
+          -o "${RUNNER_TEMP}/sprig-lint"
+        chmod +x "${RUNNER_TEMP}/sprig-lint"
+
+    - name: Stage config
+      if: inputs.config-path != ''
+      shell: bash
+      run: cp "${{ inputs.config-path }}" .sprig-lint.cfg
+
+    - name: Lint
+      shell: bash
+      env:
+        INPUT_MODE: ${{ inputs.mode }}
+        INPUT_MESSAGE: ${{ inputs.message }}
+        INPUT_FROM: ${{ inputs.from }}
+        INPUT_TO: ${{ inputs.to }}
+        PR_TITLE: ${{ github.event.pull_request.title }}
+        PR_BASE: ${{ github.event.pull_request.base.sha }}
+        PR_HEAD: ${{ github.event.pull_request.head.sha }}
+      run: |
+        set -euo pipefail
+        SPRIG_LINT="${RUNNER_TEMP}/sprig-lint"
+
+        mode="${INPUT_MODE}"
+        if [[ -z "${mode}" ]]; then
+          if [[ -n "${PR_BASE}" && -n "${PR_HEAD}" ]]; then
+            mode=range
+          elif [[ -n "${PR_TITLE}" ]]; then
+            mode=pr-title
+          elif [[ -n "${INPUT_MESSAGE}" ]]; then
+            mode=message
+          else
+            echo "sprig-lint action: unable to infer mode; set 'mode' input explicitly" >&2
+            exit 1
+          fi
+        fi
+
+        case "${mode}" in
+          range)
+            from="${INPUT_FROM:-${PR_BASE}}"
+            to="${INPUT_TO:-${PR_HEAD}}"
+            if [[ -z "${from}" || -z "${to}" ]]; then
+              echo "sprig-lint action: range mode requires 'from' and 'to' (or a pull_request event)" >&2
+              exit 1
+            fi
+            "${SPRIG_LINT}" --no-color --from "${from}" --to "${to}"
+            ;;
+          pr-title)
+            title="${INPUT_MESSAGE:-${PR_TITLE}}"
+            if [[ -z "${title}" ]]; then
+              echo "sprig-lint action: pr-title mode requires a PR title (or 'message' input)" >&2
+              exit 1
+            fi
+            "${SPRIG_LINT}" --no-color --message "${title}"
+            ;;
+          message)
+            if [[ -z "${INPUT_MESSAGE}" ]]; then
+              echo "sprig-lint action: message mode requires the 'message' input" >&2
+              exit 1
+            fi
+            "${SPRIG_LINT}" --no-color --message "${INPUT_MESSAGE}"
+            ;;
+          *)
+            echo "sprig-lint action: unknown mode '${mode}' (expected: range | pr-title | message)" >&2
+            exit 1
+            ;;
+        esac

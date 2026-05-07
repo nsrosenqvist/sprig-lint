@@ -352,6 +352,50 @@ output=$(cd "${repo}" && bash "${SPRIG_LINT}" "${msg_file}" --quiet 2>&1) || exi
 assert_eq "1" "${exit_code}" "exits 1 regardless of arg order"
 assert_eq "" "${output}" "still quiet when flag comes after path"
 
+describe "--message lints a literal string (valid)"
+exit_code=0
+output=$(bash "${SPRIG_LINT}" --message "feat: add login" 2>&1) || exit_code=$?
+assert_eq "0" "${exit_code}" "valid --message exits 0"
+assert_eq "" "${output}" "valid --message is silent"
+
+describe "--message lints a literal string (invalid)"
+exit_code=0
+output=$(bash "${SPRIG_LINT}" --message "fix the bug" 2>&1) || exit_code=$?
+assert_eq "1" "${exit_code}" "invalid --message exits 1"
+assert_contains "${output}" "format:" "invalid --message reports format error"
+
+describe "--message= (equals form) works"
+exit_code=0
+output=$(bash "${SPRIG_LINT}" --message="feat: add login" 2>&1) || exit_code=$?
+assert_eq "0" "${exit_code}" "--message= exits 0 on valid"
+
+describe "--message accepts empty PR titles as invalid"
+exit_code=0
+output=$(bash "${SPRIG_LINT}" --message "" 2>&1) || exit_code=$?
+assert_eq "1" "${exit_code}" "empty --message exits 1"
+
+describe "Stdin mode lints a piped message (valid)"
+exit_code=0
+output=$(printf 'feat: add login' | bash "${SPRIG_LINT}" - 2>&1) || exit_code=$?
+assert_eq "0" "${exit_code}" "valid stdin exits 0"
+
+describe "Stdin mode lints a piped message (invalid)"
+exit_code=0
+output=$(printf 'fix the bug' | bash "${SPRIG_LINT}" - 2>&1) || exit_code=$?
+assert_eq "1" "${exit_code}" "invalid stdin exits 1"
+assert_contains "${output}" "format:" "stdin reports format error"
+
+describe "Combining --message with file is rejected"
+exit_code=0
+output=$(bash "${SPRIG_LINT}" --message "feat: x" "${msg_file}" 2>&1) || exit_code=$?
+assert_eq "1" "${exit_code}" "combining inputs exits 1"
+assert_contains "${output}" "only one of" "error explains conflict"
+
+describe "Combining --message with --from/--to is rejected"
+exit_code=0
+output=$(bash "${SPRIG_LINT}" --message "feat: x" --from HEAD~1 --to HEAD 2>&1) || exit_code=$?
+assert_eq "1" "${exit_code}" "combining --message + range exits 1"
+
 cleanup_repo "${repo}"
 
 # ============================================================================
@@ -439,7 +483,7 @@ echo "feat: x" > "${repo}/msg.txt"
 exit_code=0
 output=$(cd "${repo}" && bash "${SPRIG_LINT}" --from HEAD --to HEAD "${repo}/msg.txt" 2>&1) || exit_code=$?
 assert_eq "1" "${exit_code}" "combined modes rejected"
-assert_contains "${output}" "cannot combine" "error reported"
+assert_contains "${output}" "only one of" "error reported"
 cleanup_repo "${repo}"
 
 describe "Range: --quiet suppresses output"

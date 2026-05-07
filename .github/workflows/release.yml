@@ -1,0 +1,100 @@
+name: Release
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    outputs:
+      is_prerelease: ${{ steps.detect.outputs.is_prerelease }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Detect prerelease
+        id: detect
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          # Pre-release suffix (e.g. -alpha, -beta.1, -rc.2)
+          if [[ "$VERSION" == *-* ]]; then
+            echo "is_prerelease=true"  >> "$GITHUB_OUTPUT"
+          else
+            echo "is_prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run tests and shellcheck
+        run: |
+          shellcheck -x sprig-lint install.sh test/test.sh
+          bash test/test.sh
+
+      - name: Stage release artifacts
+        run: |
+          mkdir -p artifacts
+          cp sprig-lint   artifacts/sprig-lint
+          cp install.sh   artifacts/install.sh
+          cd artifacts
+          sha256sum sprig-lint install.sh > SHA256SUMS
+
+      - name: Build changelog
+        run: |
+          # Find the previous semver tag (excluding floating major/minor tags like v1, v1.2)
+          PREV_TAG=$(git tag --list 'v*.*.*' --sort=-v:refname \
+            | grep -v "^${GITHUB_REF_NAME}$" | head -n 1)
+
+          if [ -n "$PREV_TAG" ]; then
+            RANGE="${PREV_TAG}..${GITHUB_REF_NAME}"
+            DIFF_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/compare/${PREV_TAG}...${GITHUB_REF_NAME}"
+          else
+            RANGE="${GITHUB_REF_NAME}"
+            DIFF_URL=""
+          fi
+
+          {
+            echo "## What's Changed"
+            echo ""
+            git log "$RANGE" --pretty=format:"- %s (%h)" --no-merges
+            echo ""
+            if [ -n "$DIFF_URL" ]; then
+              echo ""
+              echo "**Full Changelog**: ${DIFF_URL}"
+            fi
+          } > release_notes.md
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: release_notes.md
+          prerelease: ${{ steps.detect.outputs.is_prerelease == 'true' }}
+          files: |
+            artifacts/sprig-lint
+            artifacts/install.sh
+            artifacts/SHA256SUMS
+
+  update-floating-tags:
+    needs: release
+    if: needs.release.outputs.is_prerelease != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Update floating major and minor version tags
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          VERSION="${GITHUB_REF_NAME#v}"
+          MAJOR="v${VERSION%%.*}"
+          MINOR="v${VERSION%.*}"
+
+          for TAG in "$MAJOR" "$MINOR"; do
+            git tag -f "$TAG" "$GITHUB_REF_NAME"
+            git push origin "$TAG" --force
+          done
