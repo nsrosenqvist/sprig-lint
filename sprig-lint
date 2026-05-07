@@ -1,0 +1,224 @@
+#!/usr/bin/env bash
+# sprig-lint — validate commit messages against the Conventional Commits spec
+# https://github.com/nsrosenqvist/sprig-lint
+#
+# Designed as a git `commit-msg` hook: receives the path to the commit message
+# file as $1 and exits non-zero on validation failure.
+set -euo pipefail
+
+# --- Output settings (set in main) ---
+quiet=false
+_red=""
+_dim=""
+_bold=""
+_reset=""
+
+# --- Defaults ---
+allowed_types='feat,fix,chore,refactor,docs,test,style,perf,build,ci,revert'
+require_scope=false
+max_subject_length=72
+allow_merge_commits=true
+allow_revert_commits=true
+allow_fixup_commits=true
+ignored_branches='^$' # never matches by default; commit-msg runs after branch checks anyway
+
+# --- Config loading ---
+load_config() {
+  local config_file=""
+  local repo_root
+
+  repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" || return 0
+
+  if [[ -f "${repo_root}/.sprig-lint.cfg" ]]; then
+    config_file="${repo_root}/.sprig-lint.cfg"
+  elif [[ -f "${HOME}/.sprig-lint.cfg" ]]; then
+    config_file="${HOME}/.sprig-lint.cfg"
+  fi
+
+  if [[ -n "${config_file}" ]]; then
+    # Security: only source lines that match safe key=value patterns.
+    # Block command substitution ($(...), `...`) and semicolons.
+    local safe_lines
+    safe_lines=$(grep -E '^\s*(allowed_types|require_scope|max_subject_length|allow_merge_commits|allow_revert_commits|allow_fixup_commits|ignored_branches)\s*=' "$config_file" \
+      | grep -vE '`|\$\(' \
+      | grep -E "^[a-z_]+=['\"]?[^;\`]*['\"]?\s*$" || true)
+
+    if [[ -n "${safe_lines}" ]]; then
+      eval "${safe_lines}"
+    fi
+  fi
+}
+
+# Print an error message and exit 1.
+fail() {
+  if [[ "${quiet}" != "true" ]]; then
+    echo "${_red}${_bold}sprig-lint:${_reset}${_red} error:${_reset} $1" >&2
+    if [[ -n "${2:-}" ]]; then
+      echo "${_dim}sprig-lint:   ${2}${_reset}" >&2
+    fi
+    echo "${_dim}sprig-lint: see https://www.conventionalcommits.org/ for the spec${_reset}" >&2
+  fi
+  exit 1
+}
+
+# Check whether a value is in a comma-separated list.
+in_list() {
+  local needle="$1" list="$2" item IFS_old="${IFS}"
+  IFS=','
+  for item in ${list}; do
+    # strip surrounding whitespace
+    item="${item## }"
+    item="${item%% }"
+    if [[ "${needle}" == "${item}" ]]; then
+      IFS="${IFS_old}"
+      return 0
+    fi
+  done
+  IFS="${IFS_old}"
+  return 1
+}
+
+# --- Main ---
+main() {
+  local commit_msg_file=""
+  local arg
+  for arg in "$@"; do
+    case "${arg}" in
+      -q|--quiet)
+        quiet=true
+        ;;
+      -h|--help)
+        cat <<EOF
+sprig-lint — validate commit messages against the Conventional Commits spec
+
+Usage: sprig-lint [options] <commit-msg-file>
+
+Options:
+  -q, --quiet     Suppress all output (still exits non-zero on failure)
+  -h, --help      Show this help and exit
+
+Configure via .sprig-lint.cfg in the repo root or \$HOME.
+See https://github.com/nsrosenqvist/sprig-lint for details.
+EOF
+        exit 0
+        ;;
+      -*)
+        echo "sprig-lint: error: unknown option: ${arg}" >&2
+        exit 1
+        ;;
+      *)
+        commit_msg_file="${arg}"
+        ;;
+    esac
+  done
+
+  # Enable color when stderr is a TTY and not in quiet mode.
+  if [[ "${quiet}" != "true" && -t 2 ]]; then
+    _red=$'\033[31m'
+    _dim=$'\033[2m'
+    _bold=$'\033[1m'
+    _reset=$'\033[0m'
+  fi
+
+  if [[ -z "${commit_msg_file}" ]]; then
+    if [[ "${quiet}" != "true" ]]; then
+      echo "${_red}sprig-lint: error:${_reset} commit message file path required (passed by git)" >&2
+    fi
+    exit 1
+  fi
+
+  if [[ ! -f "${commit_msg_file}" ]]; then
+    if [[ "${quiet}" != "true" ]]; then
+      echo "${_red}sprig-lint: error:${_reset} commit message file not found: ${commit_msg_file}" >&2
+    fi
+    exit 1
+  fi
+
+  load_config
+
+  # Optional: skip on ignored branches (rarely useful for commit-msg but available)
+  local branch
+  if branch="$(git symbolic-ref --short HEAD 2>/dev/null)"; then
+    if [[ -n "${branch}" && "${branch}" =~ ${ignored_branches} ]]; then
+      exit 0
+    fi
+  fi
+
+  # Read the message and find the first non-comment, non-blank line (subject).
+  local subject="" line
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    if [[ "${line}" == *"------------------------ >8 ------------------------"* ]]; then
+      break
+    fi
+    if [[ "${line}" =~ ^[[:space:]]*# ]]; then
+      continue
+    fi
+    if [[ -n "${line// /}" ]]; then
+      subject="${line}"
+      break
+    fi
+  done < "${commit_msg_file}"
+
+  if [[ -z "${subject}" ]]; then
+    fail "commit message is empty"
+  fi
+
+  # Allow special commit kinds without further validation.
+  if [[ "${allow_merge_commits}" == "true" && "${subject}" =~ ^Merge[[:space:]] ]]; then
+    exit 0
+  fi
+  if [[ "${allow_revert_commits}" == "true" && "${subject}" =~ ^Revert[[:space:]] ]]; then
+    exit 0
+  fi
+  if [[ "${allow_fixup_commits}" == "true" && "${subject}" =~ ^(fixup|squash|amend)! ]]; then
+    exit 0
+  fi
+
+  # Parse the conventional commit subject:
+  #   type(scope)?!?: subject
+  local cc_pattern='^([a-zA-Z]+)(\(([^)]+)\))?(!)?:[[:space:]](.+)$'
+  if [[ ! "${subject}" =~ ${cc_pattern} ]]; then
+    fail "subject does not follow Conventional Commits format" \
+         "expected '<type>[(scope)][!]: <description>', got: ${subject}"
+  fi
+
+  local type="${BASH_REMATCH[1]}"
+  local scope="${BASH_REMATCH[3]:-}"
+  # local bang="${BASH_REMATCH[4]:-}"  # currently unused; reserved for future checks
+  local desc="${BASH_REMATCH[5]}"
+
+  # Type must be lowercase ASCII letters.
+  if [[ ! "${type}" =~ ^[a-z]+$ ]]; then
+    fail "type must be lowercase letters only" "got: ${type}"
+  fi
+
+  # Type must be in the allowed list.
+  if ! in_list "${type}" "${allowed_types}"; then
+    fail "type '${type}' is not in allowed_types" "allowed: ${allowed_types}"
+  fi
+
+  # Scope rules.
+  if [[ "${require_scope}" == "true" && -z "${scope}" ]]; then
+    fail "scope is required but missing" "expected '${type}(<scope>): ...'"
+  fi
+  if [[ -n "${scope}" && -z "${scope// /}" ]]; then
+    fail "scope is empty" "got: ${type}(): ${desc}"
+  fi
+
+  # Description must not be empty or whitespace-only.
+  if [[ -z "${desc// /}" ]]; then
+    fail "description is empty"
+  fi
+
+  # Subject length check (0 disables).
+  if [[ "${max_subject_length}" -gt 0 ]]; then
+    if [[ "${#subject}" -gt "${max_subject_length}" ]]; then
+      fail "subject exceeds max_subject_length (${max_subject_length})" \
+           "${#subject} chars: ${subject}"
+    fi
+  fi
+
+  exit 0
+}
+
+main "$@"
