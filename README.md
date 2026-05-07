@@ -1,29 +1,28 @@
 # sprig-lint
 
-A zero-dependency git hook that validates commit messages against the [Conventional Commits](https://www.conventionalcommits.org/) standard.
+A zero-dependency git hook that validates commit messages against the [Conventional Commits](https://www.conventionalcommits.org/) standard — at commit time, in CI, or both.
 
 ```
 You type:  fix the bug
-You get:   sprig-lint: error: subject does not follow Conventional Commits format
-           sprig-lint:   expected '<type>[(scope)][!]: <description>', got: fix the bug
+You get:   ✗ format: subject does not follow Conventional Commits format
+              expected '<type>[(scope)][!]: <description>', got: fix the bug
 
 You type:  fix: resolve crash on startup
-You get:   ✓ commit accepted
+You get:   (silent — commit accepted)
 ```
 
-**Why?** Linting at commit time catches bad messages before they enter history, when they're still cheap to fix. No CI round-trip, no force-pushes, no rebases.
+**Why?** Linting at commit time catches bad messages before they enter history, when they're still cheap to fix. No CI round-trip, no force-pushes, no rebases. And when you do want CI-side enforcement, range mode lints whole PRs in one shot.
 
 `sprig-lint` is a companion to [sprig-commit](https://github.com/nsrosenqvist/sprig-commit) — they share a philosophy (single bash script, zero deps) and compose cleanly: sprig-commit *injects* ticket scopes, sprig-lint *verifies* the result. Either works standalone.
 
 ## How it works
 
-`sprig-lint` runs as a git `commit-msg` hook. When you commit:
+`sprig-lint` runs as a git `commit-msg` hook (or in CI). It:
 
-1. Reads the commit message file
-2. Finds the first non-comment, non-blank line (the subject)
-3. Validates it against `<type>[(scope)][!]: <description>`
-4. Checks the type is in `allowed_types`, the description is non-empty, and the line length is within `max_subject_length`
-5. Exits 0 if valid, 1 with an actionable error if not
+1. Finds the subject line — the first non-comment, non-blank line.
+2. Validates the format (`<type>[(scope)][!]: <description>`).
+3. Checks each rule with its configured severity and collects findings.
+4. Prints findings (red ✗ for errors, yellow ⚠ for warnings) and exits 1 if any errors.
 
 | Subject | Result |
 |---|---|
@@ -37,6 +36,7 @@ You get:   ✓ commit accepted
 | `FEAT: x` | ✗ type must be lowercase |
 | `wibble: x` | ✗ type not in allowed_types |
 | `feat: ` | ✗ description is empty |
+| `feat(): x` | ✗ scope is empty |
 
 ## Install
 
@@ -61,10 +61,13 @@ chmod +x .git/hooks/commit-msg
 
 | Flag | Description |
 |---|---|
-| `-q`, `--quiet` | Suppress all output (still exits non-zero on failure). Useful for CI/CD. |
+| `-q`, `--quiet` | Suppress all output (still exits non-zero on failure). For CI. |
+| `--no-color` | Disable ANSI color output (also honors the `NO_COLOR` environment variable). |
 | `-h`, `--help` | Show usage and exit. |
+| `--from REF --to REF` | Range mode: lint each commit's message in `REF..REF`. |
+| `--range REF..REF` | Same as `--from`/`--to`. |
 
-Error output is automatically colorized when stderr is a TTY; colors are suppressed when piped, redirected, or when `--quiet` is set.
+Error output is automatically colorized when stderr is a TTY; colors are suppressed when piped, redirected, when `--quiet` is set, when `--no-color` is passed, or when the [`NO_COLOR`](https://no-color.org) environment variable is set.
 
 ### With Husky
 
@@ -85,56 +88,121 @@ Install both — they run on different hooks and don't interfere:
 
 ## Configuration
 
-Create `.sprig-lint.cfg` at the repo root (or `~/.sprig-lint.cfg` for a global default). Format is `key=value`:
+Create `.sprig-lint.cfg` at the repo root (or `~/.sprig-lint.cfg` for a global default). Format is `key=value`.
+
+Validation rules use a **severity level**: `error` (fails commit, exit 1), `warn` (printed but exit 0), or `off` (rule skipped).
 
 ```bash
-# Allowed conventional commit types (comma-separated)
+# Severity rules (defaults shown)
+format=error
+type_case=error
+type_allowed=error
+scope_required=off
+scope_empty=error
+description_empty=error
+subject_max_length=error
+subject_full_stop=off            # reject trailing period
+subject_leading_capital=off      # reject "feat: Add login"
+body_max_line_length=off         # body line wrapping
+
+# Values
 allowed_types='feat,fix,chore,refactor,docs,test,style,perf,build,ci,revert'
+max_subject_length=72            # 0 disables
+max_body_line_length=100         # 0 disables
 
-# Require a scope on every commit (e.g. feat(core): ...)
-require_scope=false
-
-# Max subject line length; 0 disables the check
-max_subject_length=72
-
-# Allow auto-generated commits to bypass validation
+# Toggles
 allow_merge_commits=true
 allow_revert_commits=true
 allow_fixup_commits=true
-
-# Regex of branches where validation should be skipped
-ignored_branches='^$'
+ignored_branches='^$'            # regex; default matches nothing
 ```
 
 ### Options reference
 
 | Option | Default | Description |
 |---|---|---|
-| `allowed_types` | `feat,fix,chore,refactor,docs,test,style,perf,build,ci,revert` | Comma-separated list of allowed types. Unknown types are rejected. |
-| `require_scope` | `false` | When `true`, every commit must have a scope: `type(scope): ...`. |
-| `max_subject_length` | `72` | Maximum length of the subject line. Set to `0` to disable. |
-| `allow_merge_commits` | `true` | Skip validation for subjects starting with `Merge `. |
-| `allow_revert_commits` | `true` | Skip validation for subjects starting with `Revert `. |
-| `allow_fixup_commits` | `true` | Skip validation for `fixup!`, `squash!`, `amend!` commits. |
-| `ignored_branches` | `^$` | Regex of branches where the hook exits silently. Default matches nothing. |
+| `format` | `error` | Subject must match `<type>[(scope)][!]: <description>`. |
+| `type_case` | `error` | Type must be lowercase ASCII letters only. |
+| `type_allowed` | `error` | Type must be in `allowed_types`. |
+| `scope_required` | `off` | Require a scope on every commit. |
+| `scope_empty` | `error` | Reject empty scopes (`feat(): x`). |
+| `description_empty` | `error` | Reject empty/whitespace descriptions. |
+| `subject_max_length` | `error` | Subject must fit within `max_subject_length`. |
+| `subject_full_stop` | `off` | Reject subjects ending in `.`. |
+| `subject_leading_capital` | `off` | Reject descriptions starting with a capital letter. |
+| `body_max_line_length` | `off` | Body lines must fit within `max_body_line_length`. |
+| `allowed_types` | *(spec set)* | Comma-separated whitelist of types. |
+| `max_subject_length` | `72` | Subject character cap. `0` disables. |
+| `max_body_line_length` | `100` | Body line character cap. `0` disables. |
+| `allow_merge_commits` | `true` | Skip validation on `Merge ` commits. |
+| `allow_revert_commits` | `true` | Skip validation on `Revert ` commits. |
+| `allow_fixup_commits` | `true` | Skip validation on `fixup!`, `squash!`, `amend!`. |
+| `ignored_branches` | `^$` | Regex of branches to skip in hook mode. |
+
+## CI / PR validation
+
+Range mode lints every commit between two refs. Useful in CI to validate an entire PR in one step:
+
+```bash
+sprig-lint --from "$BASE_SHA" --to "$HEAD_SHA"
+```
+
+### Picking the right range
+
+The base ref must be the **merge base** (where the PR branched off), not the current tip of the target branch. Otherwise, if the target branch advanced after the PR was opened, you'll lint commits that came in from the target branch and aren't part of the PR.
+
+```bash
+base=$(git merge-base origin/main HEAD)
+sprig-lint --from "${base}" --to HEAD
+```
+
+### GitHub Actions
+
+```yaml
+name: Commit Lint
+on: [pull_request]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: |
+          curl -fsSL https://raw.githubusercontent.com/nsrosenqvist/sprig-lint/main/sprig-lint -o /usr/local/bin/sprig-lint
+          chmod +x /usr/local/bin/sprig-lint
+      - run: |
+          sprig-lint \
+            --from "${{ github.event.pull_request.base.sha }}" \
+            --to   "${{ github.event.pull_request.head.sha }}"
+```
+
+GitHub already provides the correct merge-base SHA in `pull_request.base.sha` for non-rebased PRs. For more complex workflows, compute it explicitly with `git merge-base`.
+
+### Squash-merge workflows
+
+If your team always squash-merges PRs, the individual commit messages don't end up in `main`'s history — only the squash commit (taken from the PR title) does. In that case, range linting the PR commits is mostly noise. Lint the PR title separately (e.g., a commitlint-style GitHub Action) and skip range mode.
 
 ## Behavior details
 
 ### What is validated
 
 - **Format**: subject matches `<type>[(scope)][!]: <description>`
-- **Type**: lowercase ASCII letters only, present in `allowed_types`
+- **Type**: lowercase ASCII letters, present in `allowed_types`
 - **Scope** *(if present)*: non-empty
 - **Description**: non-empty (whitespace-only is rejected)
-- **Length**: subject ≤ `max_subject_length`
+- **Subject length**: ≤ `max_subject_length`
+- **Trailing period** *(opt-in)*: rejected when `subject_full_stop != off`
+- **Leading capital** *(opt-in)*: rejected when `subject_leading_capital != off`
+- **Body line length** *(opt-in)*: each body line ≤ `max_body_line_length`
 
 ### What is **not** validated
 
-- Body and footer formatting (the spec is loose here; teams disagree)
-- BREAKING CHANGE footer presence (you can add this in your own pre-commit policy)
-- Imperative mood, capitalization style, trailing periods (style preferences, not spec)
-
-If you want stricter rules, fork the script — it's small and readable on purpose.
+- BREAKING CHANGE footer presence
+- Imperative mood, exact case patterns beyond leading-capital, body grammar
+- URL- or code-block-aware body wrapping (long URLs in a body will trip `body_max_line_length` — split them or disable the rule)
+- Footer formatting (`Signed-off-by`, etc.)
 
 ### Edge cases
 
@@ -145,7 +213,9 @@ If you want stricter rules, fork the script — it's small and readable on purpo
 | Comments before subject | Skipped; first non-comment line is validated |
 | Scissors line (`# ------------------------ >8 ------------------------`) | Everything below is ignored |
 | Merge / Revert / fixup! / squash! / amend! | Allowed by default; toggleable per kind |
-| Ignored branch | Hook exits silently (exit 0) |
+| Ignored branch (hook mode only) | Hook exits silently (exit 0) |
+| Range over a merge commit | Merge commits are skipped via `git rev-list --no-merges` |
+| Warnings only, no errors | Exit code 0 |
 
 ## Requirements
 
@@ -160,7 +230,7 @@ bash test/test.sh
 shellcheck sprig-lint install.sh test/test.sh
 ```
 
-The tests create temporary git repos, run the hook against various scenarios, and verify exit codes and error output. No external test framework is required.
+The tests create temporary git repos, run the hook against various scenarios, and verify exit codes, error output, and range-mode behavior. No external test framework is required.
 
 ## License
 

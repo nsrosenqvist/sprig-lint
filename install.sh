@@ -32,10 +32,25 @@ if [[ ! -f "${config_path}" ]]; then
   cat > "${config_path}" << 'EOF'
 # sprig-lint configuration
 # See https://github.com/nsrosenqvist/sprig-lint for details
-
+#
+# Severity rules: error | warn | off
+# format=error
+# type_case=error
+# type_allowed=error
+# scope_required=off
+# scope_empty=error
+# description_empty=error
+# subject_max_length=error
+# subject_full_stop=off
+# subject_leading_capital=off
+# body_max_line_length=off
+#
+# Values
 # allowed_types='feat,fix,chore,refactor,docs,test,style,perf,build,ci,revert'
-# require_scope=false
 # max_subject_length=72
+# max_body_line_length=100
+#
+# Toggles
 # allow_merge_commits=true
 # allow_revert_commits=true
 # allow_fixup_commits=true

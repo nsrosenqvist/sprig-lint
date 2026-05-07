@@ -2,25 +2,45 @@
 # sprig-lint — validate commit messages against the Conventional Commits spec
 # https://github.com/nsrosenqvist/sprig-lint
 #
-# Designed as a git `commit-msg` hook: receives the path to the commit message
-# file as $1 and exits non-zero on validation failure.
+# Usage:
+#   sprig-lint [options] <commit-msg-file>
+#   sprig-lint [options] --from REF --to REF
+#   sprig-lint [options] --range REF..REF
 set -euo pipefail
 
 # --- Output settings (set in main) ---
 quiet=false
+no_color=false
 _red=""
+_yellow=""
 _dim=""
 _bold=""
 _reset=""
 
-# --- Defaults ---
+# --- Severity defaults: error | warn | off ---
+format=error
+type_case=error
+type_allowed=error
+scope_required=off
+scope_empty=error
+description_empty=error
+subject_max_length=error
+subject_full_stop=off
+subject_leading_capital=off
+body_max_line_length=off
+
+# --- Value defaults ---
 allowed_types='feat,fix,chore,refactor,docs,test,style,perf,build,ci,revert'
-require_scope=false
 max_subject_length=72
+max_body_line_length=100
+
+# --- Toggle defaults ---
 allow_merge_commits=true
 allow_revert_commits=true
 allow_fixup_commits=true
-ignored_branches='^$' # never matches by default; commit-msg runs after branch checks anyway
+ignored_branches='^$'
+
+_ALLOWED_KEYS='format|type_case|type_allowed|scope_required|scope_empty|description_empty|subject_max_length|subject_full_stop|subject_leading_capital|body_max_line_length|allowed_types|max_subject_length|max_body_line_length|allow_merge_commits|allow_revert_commits|allow_fixup_commits|ignored_branches'
 
 # --- Config loading ---
 load_config() {
@@ -39,9 +59,9 @@ load_config() {
     # Security: only source lines that match safe key=value patterns.
     # Block command substitution ($(...), `...`) and semicolons.
     local safe_lines
-    safe_lines=$(grep -E '^\s*(allowed_types|require_scope|max_subject_length|allow_merge_commits|allow_revert_commits|allow_fixup_commits|ignored_branches)\s*=' "$config_file" \
+    safe_lines=$(grep -E "^[[:space:]]*(${_ALLOWED_KEYS})[[:space:]]*=" "$config_file" \
       | grep -vE '`|\$\(' \
-      | grep -E "^[a-z_]+=['\"]?[^;\`]*['\"]?\s*$" || true)
+      | grep -E "^[a-z_]+=['\"]?[^;\`]*['\"]?[[:space:]]*$" || true)
 
     if [[ -n "${safe_lines}" ]]; then
       eval "${safe_lines}"
@@ -49,24 +69,88 @@ load_config() {
   fi
 }
 
-# Print an error message and exit 1.
-fail() {
-  if [[ "${quiet}" != "true" ]]; then
-    echo "${_red}${_bold}sprig-lint:${_reset}${_red} error:${_reset} $1" >&2
-    if [[ -n "${2:-}" ]]; then
-      echo "${_dim}sprig-lint:   ${2}${_reset}" >&2
-    fi
-    echo "${_dim}sprig-lint: see https://www.conventionalcommits.org/ for the spec${_reset}" >&2
-  fi
-  exit 1
+# --- Severity validation ---
+valid_severity() {
+  case "$1" in error|warn|off) return 0 ;; *) return 1 ;; esac
 }
 
-# Check whether a value is in a comma-separated list.
+validate_severities() {
+  local k v
+  for k in format type_case type_allowed scope_required scope_empty \
+           description_empty subject_max_length subject_full_stop \
+           subject_leading_capital body_max_line_length; do
+    eval "v=\${${k}}"
+    if ! valid_severity "${v}"; then
+      echo "sprig-lint: error: invalid severity for ${k}: '${v}' (expected error|warn|off)" >&2
+      exit 1
+    fi
+  done
+}
+
+# --- Findings (parallel arrays, populated per message) ---
+finding_levels=()
+finding_rules=()
+finding_msgs=()
+finding_details=()
+
+reset_findings() {
+  finding_levels=()
+  finding_rules=()
+  finding_msgs=()
+  finding_details=()
+}
+
+add_finding() {
+  local level="$1" rule="$2" msg="$3" detail="${4:-}"
+  if [[ "${level}" == "off" ]]; then return 0; fi
+  finding_levels+=("${level}")
+  finding_rules+=("${rule}")
+  finding_msgs+=("${msg}")
+  finding_details+=("${detail}")
+}
+
+# Totals across all messages in a run.
+total_errors=0
+total_warnings=0
+
+print_findings() {
+  local indent="${1:-}"
+  local n=${#finding_levels[@]}
+  local i level rule msg detail prefix color
+  for ((i = 0; i < n; i++)); do
+    level="${finding_levels[$i]}"
+    rule="${finding_rules[$i]}"
+    msg="${finding_msgs[$i]}"
+    detail="${finding_details[$i]}"
+    case "${level}" in
+      error)
+        total_errors=$((total_errors + 1))
+        prefix="✗"
+        color="${_red}"
+        ;;
+      warn)
+        total_warnings=$((total_warnings + 1))
+        prefix="⚠"
+        color="${_yellow}"
+        ;;
+      *)
+        continue
+        ;;
+    esac
+    if [[ "${quiet}" != "true" ]]; then
+      echo "${indent}${color}${_bold}${prefix} ${rule}:${_reset}${color} ${msg}${_reset}" >&2
+      if [[ -n "${detail}" ]]; then
+        echo "${indent}    ${_dim}${detail}${_reset}" >&2
+      fi
+    fi
+  done
+}
+
+# --- Helpers ---
 in_list() {
   local needle="$1" list="$2" item IFS_old="${IFS}"
   IFS=','
   for item in ${list}; do
-    # strip surrounding whitespace
     item="${item## }"
     item="${item%% }"
     if [[ "${needle}" == "${item}" ]]; then
@@ -78,74 +162,15 @@ in_list() {
   return 1
 }
 
-# --- Main ---
-main() {
-  local commit_msg_file=""
-  local arg
-  for arg in "$@"; do
-    case "${arg}" in
-      -q|--quiet)
-        quiet=true
-        ;;
-      -h|--help)
-        cat <<EOF
-sprig-lint — validate commit messages against the Conventional Commits spec
+# --- Linter ---
+# Lint a single commit message. Populates finding_* arrays.
+lint_message() {
+  local message="$1"
+  reset_findings
 
-Usage: sprig-lint [options] <commit-msg-file>
-
-Options:
-  -q, --quiet     Suppress all output (still exits non-zero on failure)
-  -h, --help      Show this help and exit
-
-Configure via .sprig-lint.cfg in the repo root or \$HOME.
-See https://github.com/nsrosenqvist/sprig-lint for details.
-EOF
-        exit 0
-        ;;
-      -*)
-        echo "sprig-lint: error: unknown option: ${arg}" >&2
-        exit 1
-        ;;
-      *)
-        commit_msg_file="${arg}"
-        ;;
-    esac
-  done
-
-  # Enable color when stderr is a TTY and not in quiet mode.
-  if [[ "${quiet}" != "true" && -t 2 ]]; then
-    _red=$'\033[31m'
-    _dim=$'\033[2m'
-    _bold=$'\033[1m'
-    _reset=$'\033[0m'
-  fi
-
-  if [[ -z "${commit_msg_file}" ]]; then
-    if [[ "${quiet}" != "true" ]]; then
-      echo "${_red}sprig-lint: error:${_reset} commit message file path required (passed by git)" >&2
-    fi
-    exit 1
-  fi
-
-  if [[ ! -f "${commit_msg_file}" ]]; then
-    if [[ "${quiet}" != "true" ]]; then
-      echo "${_red}sprig-lint: error:${_reset} commit message file not found: ${commit_msg_file}" >&2
-    fi
-    exit 1
-  fi
-
-  load_config
-
-  # Optional: skip on ignored branches (rarely useful for commit-msg but available)
-  local branch
-  if branch="$(git symbolic-ref --short HEAD 2>/dev/null)"; then
-    if [[ -n "${branch}" && "${branch}" =~ ${ignored_branches} ]]; then
-      exit 0
-    fi
-  fi
-
-  # Read the message and find the first non-comment, non-blank line (subject).
-  local subject="" line
+  # Walk message: extract subject (first non-comment, non-blank line) and body.
+  local subject="" line past_blank=false
+  local body_lines=()
   while IFS= read -r line || [[ -n "${line}" ]]; do
     if [[ "${line}" == *"------------------------ >8 ------------------------"* ]]; then
       break
@@ -153,71 +178,300 @@ EOF
     if [[ "${line}" =~ ^[[:space:]]*# ]]; then
       continue
     fi
-    if [[ -n "${line// /}" ]]; then
-      subject="${line}"
-      break
+    if [[ -z "${subject}" ]]; then
+      if [[ -n "${line// /}" ]]; then
+        subject="${line}"
+      fi
+      continue
     fi
-  done < "${commit_msg_file}"
+    # After subject is found: skip the first blank, then collect body lines.
+    if [[ "${past_blank}" != "true" ]]; then
+      if [[ -z "${line// /}" ]]; then
+        past_blank=true
+        continue
+      fi
+      past_blank=true
+    fi
+    body_lines+=("${line}")
+  done <<< "${message}"
 
   if [[ -z "${subject}" ]]; then
-    fail "commit message is empty"
+    add_finding "${description_empty}" "description_empty" "commit message is empty"
+    return 0
   fi
 
-  # Allow special commit kinds without further validation.
+  # Allow special auto-generated commit kinds.
   if [[ "${allow_merge_commits}" == "true" && "${subject}" =~ ^Merge[[:space:]] ]]; then
-    exit 0
+    return 0
   fi
   if [[ "${allow_revert_commits}" == "true" && "${subject}" =~ ^Revert[[:space:]] ]]; then
-    exit 0
+    return 0
   fi
   if [[ "${allow_fixup_commits}" == "true" && "${subject}" =~ ^(fixup|squash|amend)! ]]; then
-    exit 0
+    return 0
   fi
 
-  # Parse the conventional commit subject:
-  #   type(scope)?!?: subject
-  local cc_pattern='^([a-zA-Z]+)(\(([^)]+)\))?(!)?:[[:space:]](.+)$'
+  # Parse: type(scope?)?!?: description
+  # Note: scope inside parens is allowed to be empty here so we can report it
+  # as `scope_empty` rather than a generic format error.
+  local cc_pattern='^([a-zA-Z]+)(\(([^)]*)\))?(!)?:[[:space:]](.+)$'
   if [[ ! "${subject}" =~ ${cc_pattern} ]]; then
-    fail "subject does not follow Conventional Commits format" \
-         "expected '<type>[(scope)][!]: <description>', got: ${subject}"
+    add_finding "${format}" "format" \
+      "subject does not follow Conventional Commits format" \
+      "expected '<type>[(scope)][!]: <description>', got: ${subject}"
+    return 0
   fi
 
   local type="${BASH_REMATCH[1]}"
+  local has_scope="${BASH_REMATCH[2]:-}"
   local scope="${BASH_REMATCH[3]:-}"
-  # local bang="${BASH_REMATCH[4]:-}"  # currently unused; reserved for future checks
+  # local bang="${BASH_REMATCH[4]:-}"  # reserved for future checks
   local desc="${BASH_REMATCH[5]}"
 
-  # Type must be lowercase ASCII letters.
+  # Type case.
   if [[ ! "${type}" =~ ^[a-z]+$ ]]; then
-    fail "type must be lowercase letters only" "got: ${type}"
+    add_finding "${type_case}" "type_case" \
+      "type must be lowercase letters only" "got: ${type}"
   fi
 
-  # Type must be in the allowed list.
+  # Type allowed.
   if ! in_list "${type}" "${allowed_types}"; then
-    fail "type '${type}' is not in allowed_types" "allowed: ${allowed_types}"
+    add_finding "${type_allowed}" "type_allowed" \
+      "type '${type}' is not in allowed_types" "allowed: ${allowed_types}"
   fi
 
   # Scope rules.
-  if [[ "${require_scope}" == "true" && -z "${scope}" ]]; then
-    fail "scope is required but missing" "expected '${type}(<scope>): ...'"
-  fi
-  if [[ -n "${scope}" && -z "${scope// /}" ]]; then
-    fail "scope is empty" "got: ${type}(): ${desc}"
+  if [[ -z "${has_scope}" ]]; then
+    add_finding "${scope_required}" "scope_required" \
+      "scope is required but missing" "expected '${type}(<scope>): ...'"
+  elif [[ -z "${scope// /}" ]]; then
+    add_finding "${scope_empty}" "scope_empty" \
+      "scope is empty" "got: ${type}(): ${desc}"
   fi
 
-  # Description must not be empty or whitespace-only.
+  # Description empty / whitespace-only.
   if [[ -z "${desc// /}" ]]; then
-    fail "description is empty"
+    add_finding "${description_empty}" "description_empty" "description is empty"
   fi
 
-  # Subject length check (0 disables).
-  if [[ "${max_subject_length}" -gt 0 ]]; then
-    if [[ "${#subject}" -gt "${max_subject_length}" ]]; then
-      fail "subject exceeds max_subject_length (${max_subject_length})" \
-           "${#subject} chars: ${subject}"
+  # Subject length.
+  if [[ "${max_subject_length}" -gt 0 ]] && \
+     [[ "${#subject}" -gt "${max_subject_length}" ]]; then
+    add_finding "${subject_max_length}" "subject_max_length" \
+      "subject exceeds ${max_subject_length} chars (got ${#subject})" "${subject}"
+  fi
+
+  # Trailing period.
+  if [[ "${desc}" == *. ]]; then
+    add_finding "${subject_full_stop}" "subject_full_stop" \
+      "subject must not end with a period" "got: ${subject}"
+  fi
+
+  # Leading capital in description.
+  if [[ "${desc}" =~ ^[A-Z] ]]; then
+    add_finding "${subject_leading_capital}" "subject_leading_capital" \
+      "description must not start with a capital letter" "got: ${desc}"
+  fi
+
+  # Body line length.
+  if [[ "${max_body_line_length}" -gt 0 && ${#body_lines[@]} -gt 0 ]]; then
+    local bl
+    for bl in "${body_lines[@]}"; do
+      if [[ "${#bl}" -gt "${max_body_line_length}" ]]; then
+        add_finding "${body_max_line_length}" "body_max_line_length" \
+          "body line exceeds ${max_body_line_length} chars (got ${#bl})" "${bl}"
+      fi
+    done
+  fi
+}
+
+# --- Range mode ---
+lint_range() {
+  local from="$1" to="$2"
+  local shas
+  if ! shas="$(git rev-list --no-merges --reverse "${from}..${to}" 2>&1)"; then
+    if [[ "${quiet}" != "true" ]]; then
+      echo "${_red}sprig-lint: error:${_reset} failed to list commits in ${from}..${to}" >&2
+      echo "${shas}" >&2
+    fi
+    exit 1
+  fi
+  if [[ -z "${shas}" ]]; then
+    if [[ "${quiet}" != "true" ]]; then
+      echo "${_dim}sprig-lint: no commits to lint in ${from}..${to}${_reset}" >&2
+    fi
+    exit 0
+  fi
+
+  local commits=0 sha msg short subject_line
+  while IFS= read -r sha; do
+    [[ -z "${sha}" ]] && continue
+    commits=$((commits + 1))
+    short="${sha:0:7}"
+    msg="$(git log -1 --format=%B "${sha}")"
+    lint_message "${msg}"
+    if [[ ${#finding_levels[@]} -gt 0 ]]; then
+      if [[ "${quiet}" != "true" ]]; then
+        subject_line="${msg%%$'\n'*}"
+        echo "" >&2
+        echo "${_bold}${short}${_reset} ${_dim}${subject_line}${_reset}" >&2
+      fi
+      print_findings "  "
+    fi
+  done <<< "${shas}"
+
+  if [[ "${quiet}" != "true" ]]; then
+    echo "" >&2
+    echo "${_dim}linted ${commits} commit(s): ${total_errors} error(s), ${total_warnings} warning(s)${_reset}" >&2
+  fi
+  if [[ ${total_errors} -gt 0 ]]; then exit 1; fi
+  exit 0
+}
+
+# --- Help ---
+print_help() {
+  cat <<EOF
+sprig-lint — validate commit messages against the Conventional Commits spec
+
+Usage:
+  sprig-lint [options] <commit-msg-file>      Lint a single commit message file
+  sprig-lint [options] --from REF --to REF    Lint each commit in a range
+  sprig-lint [options] --range REF..REF       Same as --from/--to
+
+Options:
+  -q, --quiet     Suppress all output (still exits non-zero on failure)
+      --no-color  Disable ANSI color output (also honors NO_COLOR env var)
+  -h, --help      Show this help and exit
+
+Exit codes:
+  0   no errors (warnings alone do not cause non-zero exit)
+  1   one or more errors
+
+Configure via .sprig-lint.cfg in the repo root or \$HOME.
+See https://github.com/nsrosenqvist/sprig-lint for details.
+EOF
+}
+
+# --- Main ---
+main() {
+  local commit_msg_file=""
+  local from_ref=""
+  local to_ref=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -q|--quiet)
+        quiet=true
+        shift
+        ;;
+      --no-color)
+        no_color=true
+        shift
+        ;;
+      -h|--help)
+        print_help
+        exit 0
+        ;;
+      --from)
+        from_ref="${2:-}"
+        shift 2 || true
+        ;;
+      --from=*)
+        from_ref="${1#*=}"
+        shift
+        ;;
+      --to)
+        to_ref="${2:-}"
+        shift 2 || true
+        ;;
+      --to=*)
+        to_ref="${1#*=}"
+        shift
+        ;;
+      --range)
+        local r="${2:-}"
+        from_ref="${r%%..*}"
+        to_ref="${r##*..}"
+        shift 2 || true
+        ;;
+      --range=*)
+        local r="${1#*=}"
+        from_ref="${r%%..*}"
+        to_ref="${r##*..}"
+        shift
+        ;;
+      --)
+        shift
+        if [[ $# -gt 0 ]]; then commit_msg_file="$1"; shift; fi
+        ;;
+      -*)
+        echo "sprig-lint: error: unknown option: $1" >&2
+        exit 1
+        ;;
+      *)
+        commit_msg_file="$1"
+        shift
+        ;;
+    esac
+  done
+
+  # Enable color when stderr is a TTY, not in quiet mode, --no-color is not
+  # set, and the NO_COLOR environment variable is unset (https://no-color.org).
+  if [[ "${quiet}" != "true" && "${no_color}" != "true" && -z "${NO_COLOR:-}" && -t 2 ]]; then
+    _red=$'\033[31m'
+    _yellow=$'\033[33m'
+    _dim=$'\033[2m'
+    _bold=$'\033[1m'
+    _reset=$'\033[0m'
+  fi
+
+  load_config
+  validate_severities
+
+  # Range mode.
+  if [[ -n "${from_ref}" || -n "${to_ref}" ]]; then
+    if [[ -z "${from_ref}" || -z "${to_ref}" ]]; then
+      if [[ "${quiet}" != "true" ]]; then
+        echo "${_red}sprig-lint: error:${_reset} --from and --to must both be set" >&2
+      fi
+      exit 1
+    fi
+    if [[ -n "${commit_msg_file}" ]]; then
+      if [[ "${quiet}" != "true" ]]; then
+        echo "${_red}sprig-lint: error:${_reset} cannot combine range mode with a commit-msg file" >&2
+      fi
+      exit 1
+    fi
+    lint_range "${from_ref}" "${to_ref}"
+  fi
+
+  # Single-file (hook) mode.
+  if [[ -z "${commit_msg_file}" ]]; then
+    if [[ "${quiet}" != "true" ]]; then
+      echo "${_red}sprig-lint: error:${_reset} commit message file path required (or use --from/--to)" >&2
+    fi
+    exit 1
+  fi
+  if [[ ! -f "${commit_msg_file}" ]]; then
+    if [[ "${quiet}" != "true" ]]; then
+      echo "${_red}sprig-lint: error:${_reset} commit message file not found: ${commit_msg_file}" >&2
+    fi
+    exit 1
+  fi
+
+  # Branch ignore (only meaningful in hook mode).
+  local branch
+  if branch="$(git symbolic-ref --short HEAD 2>/dev/null)"; then
+    if [[ -n "${branch}" && "${branch}" =~ ${ignored_branches} ]]; then
+      exit 0
     fi
   fi
 
+  local message
+  message="$(<"${commit_msg_file}")"
+  lint_message "${message}"
+  print_findings ""
+  if [[ ${total_errors} -gt 0 ]]; then exit 1; fi
   exit 0
 }
 
