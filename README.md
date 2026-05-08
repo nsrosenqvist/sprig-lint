@@ -79,6 +79,25 @@ Error output is automatically colorized when stderr is a TTY; colors are suppres
 exec ./scripts/sprig-lint "$1"
 ```
 
+### With pre-commit
+
+Add to `.pre-commit-config.yaml`:
+
+```yaml
+repos:
+  - repo: https://github.com/nsrosenqvist/sprig-lint
+    rev: v1
+    hooks:
+      - id: sprig-lint
+        stages: [commit-msg]
+```
+
+Then install the commit-msg hook (the default `pre-commit install` only sets up the pre-commit stage):
+
+```bash
+pre-commit install --hook-type commit-msg
+```
+
 ### Alongside sprig-commit
 
 Install both — they run on different hooks and don't interfere:

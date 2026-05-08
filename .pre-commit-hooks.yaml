@@ -1,0 +1,6 @@
+- id: sprig-lint
+  name: sprig-lint
+  description: Validate commit messages against the Conventional Commits spec
+  entry: sprig-lint
+  language: script
+  stages: [commit-msg]
